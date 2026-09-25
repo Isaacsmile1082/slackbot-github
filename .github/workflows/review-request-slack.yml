@@ -1,0 +1,146 @@
+name: Notify Slack on PR review request
+
+on:
+  pull_request_target:
+    types: [review_requested]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  notify-slack:
+    name: Send Slack notification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Classify review request and notify Slack
+        shell: bash
+        env:
+          GITHUB_GRAPHQL_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REQUESTED_REVIEWER: ${{ github.event.requested_reviewer.login }}
+          REQUESTED_TEAM: ${{ github.event.requested_team.slug }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "SLACK_WEBHOOK_URL is not configured."
+            exit 1
+          fi
+
+          if [[ -n "${REQUESTED_REVIEWER:-}" ]]; then
+            review_target="@${REQUESTED_REVIEWER}"
+          elif [[ -n "${REQUESTED_TEAM:-}" ]]; then
+            review_target="team ${REQUESTED_TEAM}"
+          else
+            echo "The event does not contain a requested reviewer or team."
+            exit 1
+          fi
+
+          graphql_query='query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                timelineItems(first: 100, after: $cursor, itemTypes: [REVIEW_REQUESTED_EVENT]) {
+                  nodes {
+                    ... on ReviewRequestedEvent {
+                      requestedReviewer {
+                        ... on User { login }
+                        ... on Team { slug }
+                      }
+                    }
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          }'
+
+          cursor=null
+          matching_requests=0
+
+          while true; do
+            request_body=$(jq -n \
+              --arg query "$graphql_query" \
+              --arg owner "$REPOSITORY_OWNER" \
+              --arg name "$REPOSITORY_NAME" \
+              --argjson number "$PR_NUMBER" \
+              --argjson cursor "$cursor" \
+              '{
+                query: $query,
+                variables: {
+                  owner: $owner,
+                  name: $name,
+                  number: $number,
+                  cursor: $cursor
+                }
+              }')
+
+            response=$(curl --fail --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer ${GITHUB_GRAPHQL_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "$request_body" \
+              https://api.github.com/graphql)
+
+            if jq -e '.errors | length > 0' <<<"$response" >/dev/null 2>&1; then
+              echo "GitHub returned an error while reading the review-request timeline."
+              exit 1
+            fi
+
+            if ! jq -e \
+              '.data.repository.pullRequest.timelineItems.nodes | type == "array"' \
+              <<<"$response" >/dev/null; then
+              echo "GitHub returned an unexpected review-request timeline response."
+              exit 1
+            fi
+
+            page_matches=$(jq \
+              --arg reviewer "${REQUESTED_REVIEWER:-}" \
+              --arg team "${REQUESTED_TEAM:-}" \
+              '[
+                .data.repository.pullRequest.timelineItems.nodes[]
+                | .requestedReviewer
+                | select(
+                    (($reviewer != "") and (.login? == $reviewer))
+                    or (($team != "") and (.slug? == $team))
+                  )
+              ] | length' <<<"$response")
+            matching_requests=$((matching_requests + page_matches))
+
+            has_next_page=$(jq -r \
+              '.data.repository.pullRequest.timelineItems.pageInfo.hasNextPage' \
+              <<<"$response")
+
+            if [[ "$has_next_page" != "true" ]]; then
+              break
+            fi
+
+            cursor=$(jq -c \
+              '.data.repository.pullRequest.timelineItems.pageInfo.endCursor' \
+              <<<"$response")
+          done
+
+          if (( matching_requests == 0 )); then
+            echo "The current review request was not found in the PR timeline."
+            exit 1
+          elif (( matching_requests == 1 )); then
+            message="Review requested from ${review_target} on PR #${PR_NUMBER}: ${PR_URL}"
+          else
+            message="Review re-requested from ${review_target} on PR #${PR_NUMBER}: ${PR_URL}"
+          fi
+
+          payload=$(jq -n --arg text "$message" '{text: $text}')
+
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            --output /dev/null \
+            "$SLACK_WEBHOOK_URL"
